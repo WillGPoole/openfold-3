@@ -37,6 +37,7 @@ from openfold3.core.data.pipelines.preprocessing.template import (
     TemplatePreprocessorInputInference,
     TemplatePreprocessorSettings,
     TemplateStructurePreprocessor,
+    _get_cif_entry_id_and_filename,
     build_template_cache_key,
     collate_data_logs,
     data_log_to_tsv,
@@ -56,6 +57,30 @@ from openfold3.projects.of3_all_atom.config.inference_query_format import (
     InferenceQuerySet,
     Query,
 )
+
+
+@pytest.mark.parametrize(
+    ("filename", "entry_id", "normalized_filename"),
+    [
+        ("3juh.cif", "3juh", "3juh.cif"),
+        ("3mb6.cif.gz", "3mb6", "3mb6.cif.gz"),
+    ],
+)
+def test_get_cif_entry_id_and_filename(filename, entry_id, normalized_filename):
+    result = _get_cif_entry_id_and_filename(Path(filename))
+    assert result == TemplateEntry(entry_id=entry_id, path=Path(normalized_filename))
+    assert result.filename == normalized_filename
+
+
+def test_cif_entry_is_immutable():
+    entry = TemplateEntry(entry_id="3mb6", path=Path("3mb6.cif.gz"))
+    with pytest.raises(AttributeError):
+        entry.entry_id = "other"
+
+
+def test_get_cif_entry_id_and_filename_rejects_unsupported_suffix():
+    with pytest.raises(ValueError, match="must end in '.cif' or '.cif.gz'"):
+        _get_cif_entry_id_and_filename(Path("3mb6.pdb"))
 
 
 def _make_template(
