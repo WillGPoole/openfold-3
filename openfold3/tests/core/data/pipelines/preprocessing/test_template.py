@@ -18,6 +18,7 @@ Train-mode tests live in test_template_train.py.
 """
 
 import getpass
+import gzip
 import os
 import shutil
 from datetime import datetime
@@ -25,7 +26,9 @@ from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
 
+import numpy as np
 import pytest
+from biotite.structure.io import pdbx
 
 import openfold3
 from openfold3.core.data.io.sequence.template import TemplateData
@@ -959,6 +962,159 @@ def _two_source_query_set(tmp_path: Path, order: list[str]) -> InferenceQuerySet
     )
 
 
+def test_cif_direct_mixed_suffixes_use_provided_paths(tmp_path):
+    """CIF-direct mode preserves paths for underscore-containing entry IDs."""
+    plain_path = tmp_path / "2q2k.cif"
+    compressed_path = tmp_path / "2q2k_copy.cif.gz"
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, plain_path)
+    with plain_path.open("rb") as source, gzip.open(compressed_path, "wb") as target:
+        shutil.copyfileobj(source, target)
+
+    query_sequence = get_asym_id_to_canonical_seq_dict(_load_ciffile(plain_path))["B"]
+    query_set = InferenceQuerySet(
+        queries={
+            "mixed_suffixes": Query(
+                chains=[
+                    Chain(
+                        molecule_type="protein",
+                        chain_ids=["A"],
+                        sequence=query_sequence,
+                        template_cif_paths=[plain_path, compressed_path],
+                    )
+                ]
+            )
+        }
+    )
+    config = TemplatePreprocessorSettings(
+        output_directory=tmp_path / "intermediate",
+        fetch_missing_structures=False,
+        n_processes=1,
+    )
+
+    TemplatePreprocessor(query_set, config)()
+
+    chain = query_set.queries["mixed_suffixes"].chains[0]
+    assert chain.template_alignment_file_path is not None
+    assert chain.template_entry_chain_ids == ["2q2k_B", "2q2k_copy_B"]
+
+    with np.load(chain.template_alignment_file_path, allow_pickle=True) as cache:
+        assert cache["2q2k_B"].item()["cif_path"] == str(plain_path)
+        assert cache["2q2k_copy_B"].item()["cif_path"] == str(compressed_path)
+
+
+def test_cif_direct_ignores_same_stem_precache_sequences(tmp_path):
+    """Direct mode aligns against the pinned CIF, not a same-stem precache."""
+    cif_path = tmp_path / TEMPLATE_CIF
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, cif_path)
+    query_sequence = get_asym_id_to_canonical_seq_dict(_load_ciffile(cif_path))["B"]
+
+    precache_directory = tmp_path / "precache"
+    precache_directory.mkdir()
+    np.savez_compressed(
+        precache_directory / "2q2k.npz",
+        release_date="2000-01-01",
+        chain_id_seq_map={"B": "G" * len(query_sequence)},
+    )
+
+    query_set = InferenceQuerySet(
+        queries={
+            "same_stem_precache": Query(
+                chains=[
+                    Chain(
+                        molecule_type="protein",
+                        chain_ids=["A"],
+                        sequence=query_sequence,
+                        template_cif_paths=[cif_path],
+                        template_cif_chain_ids=["B"],
+                    )
+                ]
+            )
+        }
+    )
+    config = TemplatePreprocessorSettings(
+        output_directory=tmp_path / "intermediate",
+        precache_directory=precache_directory,
+        fetch_missing_structures=False,
+        n_processes=1,
+    )
+
+    TemplatePreprocessor(query_set, config)()
+
+    chain = query_set.queries["same_stem_precache"].chains[0]
+    assert chain.template_entry_chain_ids == ["2q2k_B"]
+
+
+def test_cif_direct_template_is_not_written_to_shared_stores(tmp_path):
+    """Pinned CIFs are not copied into shared precache or array stores."""
+    cif_path = tmp_path / "inhouse_model.cif"
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, cif_path)
+    query_sequence = get_asym_id_to_canonical_seq_dict(_load_ciffile(cif_path))["B"]
+    query_set = InferenceQuerySet(
+        queries={
+            "pinned": Query(
+                chains=[
+                    Chain(
+                        molecule_type="protein",
+                        chain_ids=["A"],
+                        sequence=query_sequence,
+                        template_cif_paths=[cif_path],
+                        template_cif_chain_ids=["B"],
+                    )
+                ]
+            )
+        }
+    )
+    config = TemplatePreprocessorSettings(
+        output_directory=tmp_path / "intermediate",
+        create_precache=True,
+        preparse_structures=True,
+        fetch_missing_structures=False,
+        n_processes=1,
+    )
+
+    TemplatePreprocessor(query_set, config)()
+
+    chain = query_set.queries["pinned"].chains[0]
+    assert chain.template_entry_chain_ids == ["inhouse_model_B"]
+    assert not any(config.precache_directory.iterdir())
+    assert not any(config.structure_array_directory.iterdir())
+
+
+def test_cif_direct_template_without_release_date_is_kept(tmp_path):
+    """Pinned CIFs without revision metadata remain valid templates."""
+    cif_path = tmp_path / "inhouse_model.cif"
+    cif_file = pdbx.CIFFile.read(MMCIFS_DIR / TEMPLATE_CIF)
+    del cif_file.block["pdbx_audit_revision_history"]
+    cif_file.write(cif_path)
+    query_sequence = get_asym_id_to_canonical_seq_dict(_load_ciffile(cif_path))["B"]
+    query_set = InferenceQuerySet(
+        queries={
+            "undated_pinned": Query(
+                chains=[
+                    Chain(
+                        molecule_type="protein",
+                        chain_ids=["A"],
+                        sequence=query_sequence,
+                        template_cif_paths=[cif_path],
+                        template_cif_chain_ids=["B"],
+                    )
+                ]
+            )
+        }
+    )
+    config = TemplatePreprocessorSettings(
+        output_directory=tmp_path / "intermediate",
+        max_release_date=datetime(2000, 1, 1),
+        fetch_missing_structures=False,
+        n_processes=1,
+    )
+
+    TemplatePreprocessor(query_set, config)()
+
+    chain = query_set.queries["undated_pinned"].chains[0]
+    assert chain.template_entry_chain_ids == ["inhouse_model_B"]
+
+
 @pytest.mark.parametrize(
     "order",
     [
@@ -994,12 +1150,12 @@ def test_template_sources_do_not_collide_across_queries(tmp_path, order):
     custom = iqs.queries["q_custom"].chains[0]
     colabfold = iqs.queries["q_colabfold"].chains[0]
 
-    assert custom.template_entry_chain_ids == [
-        "2q2k_B"
-    ], "the custom CIF query did not get its own template"
-    assert colabfold.template_entry_chain_ids == [
-        "2q2k_C"
-    ], "the ColabFold query did not get its own template"
+    assert custom.template_entry_chain_ids == ["2q2k_B"], (
+        "the custom CIF query did not get its own template"
+    )
+    assert colabfold.template_entry_chain_ids == ["2q2k_C"], (
+        "the ColabFold query did not get its own template"
+    )
     assert (
         custom.template_alignment_file_path != colabfold.template_alignment_file_path
     ), "both queries were pointed at the same template cache entry"
@@ -1073,16 +1229,16 @@ def test_requeued_query_set_keeps_cached_templates(tmp_path):
     preprocessor()
 
     requeued_cached = run_2_qs.queries["q_colabfold"].chains[0]
-    assert (
-        requeued_cached.template_alignment_file_path == cached_path
-    ), "the cached template entry was dropped when the query set was reused"
-    assert requeued_cached.template_entry_chain_ids == [
-        "2q2k_C"
-    ], "the template ids were dropped when the query set was reused"
+    assert requeued_cached.template_alignment_file_path == cached_path, (
+        "the cached template entry was dropped when the query set was reused"
+    )
+    assert requeued_cached.template_entry_chain_ids == ["2q2k_C"], (
+        "the template ids were dropped when the query set was reused"
+    )
     requeued_raw = run_2_qs.queries["q_custom"].chains[0]
-    assert requeued_raw.template_entry_chain_ids == [
-        "2q2k_B"
-    ], "the raw source in the reused batch was not processed"
+    assert requeued_raw.template_entry_chain_ids == ["2q2k_B"], (
+        "the raw source in the reused batch was not processed"
+    )
     # Only the raw source needs preprocessing; the cached entry must not be
     # re-parsed as an alignment.
     assert len(preprocessor.inputs) == 1
@@ -1146,3 +1302,83 @@ def test_worker_messages_are_dropped_without_create_logs(tmp_path, caplog):
         if record.name.startswith("template_preprocess")
     ]
     assert worker_records == []
+
+
+# Testing
+def _cif_direct_query_set(cif_path: Path, chain_id: str = "B") -> InferenceQuerySet:
+    """One query whose only template source is the CIF at `cif_path`."""
+    seq = get_asym_id_to_canonical_seq_dict(_load_ciffile(cif_path))[chain_id]
+    return InferenceQuerySet(
+        queries={
+            "q_custom": Query(
+                chains=[
+                    Chain(
+                        molecule_type=MoleculeType.PROTEIN,
+                        chain_ids=["A"],
+                        sequence=seq,
+                        template_cif_paths=[cif_path],
+                        template_cif_chain_ids=[chain_id],
+                    )
+                ]
+            )
+        }
+    )
+
+
+def _run_preprocessor(iqs: InferenceQuerySet, tmp_path: Path, structure_dir: Path):
+    settings = TemplatePreprocessorSettings(
+        mode="predict",
+        output_directory=tmp_path / "template_data",
+        structure_directory=structure_dir,
+        # CIF-direct mode supplies its own coordinates, so nothing should be fetched.
+        fetch_missing_structures=False,
+        n_processes=1,
+    )
+    TemplatePreprocessor(input_set=iqs, config=settings)()
+    return iqs.queries["q_custom"].chains[0]
+
+
+def test_cif_direct_template_does_not_need_the_structure_directory(tmp_path):
+    """A pinned CIF is a complete coordinate source on its own.
+
+    The query supplies `template_cif_paths`, so preprocessing has the coordinates in
+    hand. It nevertheless looks the template up as
+    `<structure_directory>/<stem>.cif` and, finding nothing there with fetching off,
+    drops the template entirely. The provided file is used only for the alignment.
+
+    Regression test for https://github.com/aqlaboratory/openfold-3/issues/406
+    """
+    cif_path = tmp_path / TEMPLATE_CIF
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, cif_path)
+    structure_dir = tmp_path / "template_structures"
+    structure_dir.mkdir()  # deliberately empty
+
+    chain = _run_preprocessor(_cif_direct_query_set(cif_path), tmp_path, structure_dir)
+
+    assert chain.template_entry_chain_ids == ["2q2k_B"], (
+        "the pinned CIF was ignored because no copy was staged under its PDB ID"
+    )
+
+
+def test_cif_direct_template_filename_need_not_be_a_pdb_id(tmp_path):
+    """A pinned CIF stays usable when its filename is not a PDB ID.
+
+    Identical coordinates and sequence to the case above; only the filename differs.
+    Because the template is looked up by filename stem, a name that is not a PDB ID
+    resolves to nothing (and, with fetching enabled, to a failed RCSB download), so
+    the query silently runs template-free.
+
+    Regression test for https://github.com/aqlaboratory/openfold-3/issues/406
+    """
+    cif_path = tmp_path / "2q2k_notpdb.cif"
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, cif_path)
+    structure_dir = tmp_path / "template_structures"
+    structure_dir.mkdir()
+    # The deposited entry *is* staged: only the pinned file's name is unusual.
+    shutil.copy(MMCIFS_DIR / TEMPLATE_CIF, structure_dir / TEMPLATE_CIF)
+
+    chain = _run_preprocessor(_cif_direct_query_set(cif_path), tmp_path, structure_dir)
+
+    assert chain.template_entry_chain_ids, (
+        "a valid template was dropped because its filename is not a PDB ID"
+    )

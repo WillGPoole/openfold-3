@@ -102,7 +102,10 @@ from openfold3.core.data.primitives.structure.template import (
 )
 from openfold3.core.data.primitives.structure.template_paths import (
     TemplateEntry,
+    get_template_structure_paths,
     iter_template_structure_entries,
+    iter_template_structure_paths,
+    resolve_template_structure_path,
 )
 from openfold3.core.data.resources.residues import (
     MoleculeType,
@@ -114,11 +117,22 @@ from openfold3.projects.of3_all_atom.config.inference_query_format import (
 logger = logging.getLogger(__name__)
 
 
+def _get_cif_entry_id_and_filename(cif_path: Path) -> TemplateEntry:
+    """Return the entry ID and filename for a direct CIF input.
+
+    ``Path.stem`` only removes the final suffix, so using it for a compressed CIF
+    such as ``3mb6.cif.gz`` would incorrectly produce ``3mb6.cif``. Direct CIF
+    inputs support exactly the two filename forms handled here.
+    """
+    return TemplateEntry.from_cif_path(cif_path)
+
+
 # TODO: rename variables to be PDB-agnostic
 # --- Template alignment preprocessing ---
 # Step 1/3: Create sequence cache for template structures
 def create_template_precache_entry_for_template(
     template_pdb_id: str,
+    template_structure_path: Path,
     template_structures_directory: Path,
     template_structures_filename: str,
     template_precache_dir: Path,
@@ -129,6 +143,8 @@ def create_template_precache_entry_for_template(
     Args:
         template_pdb_id (str):
             The PDB ID of the template structure.
+        template_structure_path (Path):
+            The already-resolved path to the template structure.
         template_structures_directory (Path):
             Path to the directory containing template structures in mmCIF format.
         template_precache_dir (Path):
@@ -141,10 +157,6 @@ def create_template_precache_entry_for_template(
     assert template_process_logger is not None
 
     try:
-        template_structure_path = template_structures_directory / (
-            template_structures_filename.format(pdb=template_pdb_id)
-            + f".{template_file_format}"
-        )
         cif_file = _load_ciffile(template_structure_path)
         chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
         release_date = get_release_date(get_cif_block(cif_file)).strftime("%Y-%m-%d")
@@ -195,7 +207,9 @@ class _OF3TemplatePreCacheConstructor:
         self.log_dir = log_dir
 
     @wraps(create_template_precache_entry_for_template)
-    def __call__(self, template_pdb_id: str) -> None:
+    def __call__(self, template_entry: TemplateEntry) -> None:
+        template_pdb_id = template_entry.entry_id
+        template_structure_path = template_entry.path
         try:
             # Create logger and set it as the context logger for the process
             TEMPLATE_PROCESS_LOGGER.set(
@@ -209,6 +223,7 @@ class _OF3TemplatePreCacheConstructor:
             # Create sequence cache for template
             create_template_precache_entry_for_template(
                 template_pdb_id=template_pdb_id,
+                template_structure_path=template_structure_path,
                 template_structures_directory=self.template_structures_directory,
                 template_structures_filename=self.template_structures_filename,
                 template_precache_dir=self.template_precache_dir,
@@ -256,9 +271,11 @@ def create_template_precache_of3(
 
     # Get list of PDB IDs for which the precache is to be computed
     pattern = template_structures_filename + f".{template_file_format}"
-    template_pdb_ids = [
-        m.group("pdb")
-        for f in template_structures_directory.glob(pattern.format(pdb="*"))
+    template_entries = [
+        TemplateEntry(entry_id=m.group("pdb"), path=f)
+        for f in iter_template_structure_paths(
+            template_structures_directory, template_file_format
+        )
         if (
             m := re.compile(
                 re.escape(pattern).replace(r"\{pdb\}", r"(?P<pdb>[A-Za-z0-9]+)")
@@ -284,16 +301,16 @@ def create_template_precache_of3(
             for _ in tqdm(
                 pool.imap_unordered(
                     wrapped_template_precache_constructor,
-                    template_pdb_ids,
+                    template_entries,
                     chunksize=1,
                 ),
-                total=len(template_pdb_ids),
+                total=len(template_entries),
                 desc="1/3: Creating template sequence cache",
             ):
                 pass
     else:
         for template_pdb_id in tqdm(
-            template_pdb_ids,
+            template_entries,
             desc="1/3: Creating template sequence cache",
         ):
             wrapped_template_precache_constructor(template_pdb_id)
@@ -415,8 +432,12 @@ def create_template_cache_entry_for_query(
 
     # Filter queries
     query = hits[0]
-    query_pdb_id, query_chain_id = parse_entry_chain_id(query_pdb_chain_id)
-    query_pdb_id_t, query_chain_id_t = parse_entry_chain_id(query.name)
+    query_entry = parse_entry_chain_id(query_pdb_chain_id)
+    query_pdb_id = query_entry.entry_id
+    query_chain_id = query_entry.chain_id
+    template_entry = parse_entry_chain_id(query.name)
+    query_pdb_id_t = template_entry.entry_id
+    query_chain_id_t = template_entry.chain_id
     template_cache_path_rep = template_cache_directory / Path(f"{rep_pdb_chain_id}.npz")
     if template_cache_path_rep.exists():
         template_process_logger.info(
@@ -1232,8 +1253,7 @@ def collate_data_logs(log_dir, output_dir, fname):
 # Step 1/1: Preprocess template structures
 def preprocess_template_structure_for_template_old(
     template_pdb_id: str,
-    template_structures_directory: Path,
-    template_file_format: str,
+    template_structure_path: Path,
     template_structure_array_directory: Path,
     ccd: CIFFile,
     moltypes_included: np.ndarray[int],
@@ -1244,10 +1264,8 @@ def preprocess_template_structure_for_template_old(
     Args:
         template_pdb_id (str):
             PDB ID of the template structure.
-        template_structures_directory (Path):
-            Path to the directory containing template structures in mmCIF format.
-        template_file_format (str):
-            File format of the template structures.
+        template_structure_path (Path):
+            Path to the template structure in mmCIF format.
         template_structure_array_directory (Path):
             Path to the directory where the template structure arrays will be saved.
         ccd (CIFFile):
@@ -1263,10 +1281,7 @@ def preprocess_template_structure_for_template_old(
     )
 
     # Parse template structure
-    cif_file, atom_array_template_assembly = parse_mmcif(
-        template_structures_directory
-        / Path(f"{template_pdb_id}.{template_file_format}")
-    )
+    cif_file, atom_array_template_assembly = parse_mmcif(template_structure_path)
 
     # Sanitize template structure
     atom_array_template = clean_template_atom_array(
@@ -1356,7 +1371,9 @@ class _OF3TemplateStructurePreprocessor:
         self.log_dir = log_dir
 
     @wraps(preprocess_template_structure_for_template_old)
-    def __call__(self, template_pdb_id: str) -> None:
+    def __call__(self, template_entry: TemplateEntry) -> None:
+        template_pdb_id = template_entry.entry_id
+        template_structure_path = template_entry.path
         try:
             # Create logger and set it as the context logger for the process
             TEMPLATE_PROCESS_LOGGER.set(
@@ -1371,6 +1388,7 @@ class _OF3TemplateStructurePreprocessor:
             # Preprocess template structure
             preprocess_template_structure_for_template_old(
                 template_pdb_id=template_pdb_id,
+                template_structure_path=template_structure_path,
                 template_structures_directory=self.template_structures_directory,
                 template_file_format=self.template_file_format,
                 template_structure_array_directory=self.template_structure_array_directory,
@@ -1443,29 +1461,34 @@ def preprocess_template_structures(
     )
 
     # Get list of unique template PDB IDs, create per-entry dirs
-    template_pdb_ids = []
-    for f in list(template_structures_directory.glob(f"*.{template_file_format}")):
-        template_pdb_ids.append(f.stem.split(".")[0])
+    template_entries = list(
+        iter_template_structure_entries(
+            template_structures_directory, template_file_format
+        )
+    )
 
     # Make sure there is no bias in ordering which could potentially affect
     # preprocessing times
-    random.shuffle(template_pdb_ids)
-    print(f"Found {len(template_pdb_ids)} template structures.")
+    random.shuffle(template_entries)
+    print(f"Found {len(template_entries)} template structures.")
 
     # Subset the template PDB IDs to only those that have not been preprocessed
     if completed_entries_file is not None:
         completed_entries = pd.read_csv(completed_entries_file, sep="\t", header=0)
-        template_pdb_ids = list(
-            set(template_pdb_ids) - set(completed_entries["entry"].tolist())
-        )
-        print(f"Preprocessing {len(template_pdb_ids)} template structures.")
+        completed_ids = set(completed_entries["entry"].tolist())
+        template_entries = [
+            entry for entry in template_entries if entry.entry_id not in completed_ids
+        ]
+        print(f"Preprocessing {len(template_entries)} template structures.")
 
     # Pre-create directories for template structure arrays, otherwise IO issues
-    for template_pdb_id in tqdm(
-        template_pdb_ids, desc="1/2: Creating directories", total=len(template_pdb_ids)
+    for template_entry in tqdm(
+        template_entries,
+        desc="1/2: Creating directories",
+        total=len(template_entries),
     ):
         template_assembly_dir = template_structure_array_directory / Path(
-            f"{template_pdb_id}"
+            template_entry.entry_id
         )
         template_assembly_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1489,20 +1512,20 @@ def preprocess_template_structures(
             for _ in tqdm(
                 pool.imap_unordered(
                     wrapped_template_structure_preprocessor,
-                    template_pdb_ids,
+                    template_entries,
                     chunksize=chunksize,
                 ),
-                total=len(template_pdb_ids),
+                total=len(template_entries),
                 desc="2/2: Preprocessing template structures",
             ):
                 pass
     else:
-        for template_pdb_id in tqdm(
-            template_pdb_ids,
+        for template_entry in tqdm(
+            template_entries,
             desc="2/2: Preprocessing template structures",
-            total=len(template_pdb_ids),
+            total=len(template_entries),
         ):
-            wrapped_template_structure_preprocessor(template_pdb_id)
+            wrapped_template_structure_preprocessor(template_entry)
 
 
 def build_template_cache_key(
@@ -2256,23 +2279,14 @@ class TemplatePreprocessor:
                     worker_logger.warning(f"CIF file not found: {cif_path}")
                     continue
 
-                entry_id = cif_path.stem
+                entry_id = _get_cif_entry_id_and_filename(cif_path).entry_id
 
                 specified_chain_id = None
                 if input_data.template_cif_chain_ids is not None:
                     specified_chain_id = input_data.template_cif_chain_ids[idx]
 
-                if self.precache_directory is not None:
-                    precache_file = self.precache_directory / f"{entry_id}.npz"
-                    if precache_file.exists():
-                        precache_entry = np.load(precache_file, allow_pickle=True)
-                        chain_id_seq_map = precache_entry["chain_id_seq_map"].item()
-                    else:
-                        cif_file = _load_ciffile(cif_path)
-                        chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
-                else:
-                    cif_file = _load_ciffile(cif_path)
-                    chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
+                cif_file = _load_ciffile(cif_path)
+                chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
 
                 cif_templates = parser(
                     cif_file_path=cif_path,
@@ -2365,6 +2379,21 @@ class TemplatePreprocessor:
             return _NO_WORKER_LOG
         return logging.getLogger(f"template_preprocess_{os.getpid()}")
 
+    def _resolve_template_structure_file(self, template: TemplateData) -> Path:
+        """Resolve the structure path for a parsed template."""
+        if template.cif_path is not None:
+            return template.cif_path
+
+        structure_filename = f"{template.entry_id}.{self.structure_file_format}"
+        try:
+            return resolve_template_structure_path(
+                self.structure_directory,
+                template.entry_id,
+                structure_filename,
+            )
+        except FileNotFoundError:
+            return self.structure_directory / structure_filename
+
     def _preprocess_templates_for_query(
         self,
         input_data: TemplatePreprocessorInputTrain | TemplatePreprocessorInputInference,
@@ -2372,6 +2401,15 @@ class TemplatePreprocessor:
         worker_logger = self._worker_logger()
         if self.create_logs:
             worker_logger.setLevel(logging.INFO)
+            worker_logger.propagate = False
+
+            # A multiprocessing worker can process multiple queries. Remove any
+            # handler left by an earlier query so each query gets a live, flushed
+            # file handler rather than reusing a closed or inherited handler.
+            for handler in list(worker_logger.handlers):
+                worker_logger.removeHandler(handler)
+                handler.close()
+
             handler = logging.FileHandler(self.log_directory / f"{os.getpid()}.log")
             handler.setLevel(logging.INFO)
             formatter = logging.Formatter("%(message)s")
@@ -2458,12 +2496,12 @@ class TemplatePreprocessor:
                     continue
 
                 # B. Get which files are available
-                template_structure_file = (
-                    self.structure_directory
-                    / f"{template.entry_id}.{self.structure_file_format}"
+                template_structure_file = self._resolve_template_structure_file(
+                    template
                 )
-                structure_available = template_structure_file.exists()
-                if self.precache_directory is not None:
+                is_cif_direct = template.cif_path is not None
+                structure_available = is_cif_direct or template_structure_file.exists()
+                if self.precache_directory is not None and not is_cif_direct:
                     precache_entry_file = (
                         self.precache_directory / f"{template.entry_id}.npz"
                     )
@@ -2471,7 +2509,7 @@ class TemplatePreprocessor:
                 else:
                     precache_entry_file = None
                     precache_entry_available = False
-                if self.structure_array_directory is not None:
+                if self.structure_array_directory is not None and not is_cif_direct:
                     template_structure_array_subdirectory = (
                         self.structure_array_directory / template.entry_id
                     )
@@ -2493,11 +2531,37 @@ class TemplatePreprocessor:
                     f"{template_structure_array_subdirectory}"
                 )
 
+                if (
+                    not is_cif_direct
+                    and not structure_available
+                    and not precache_entry_available
+                ):
+                    message = (
+                        "Template raw structure and precache are unavailable:\n"
+                        f"  entry_id: {template.entry_id}\n"
+                        f"  chain_id: {template.chain_id}\n"
+                        f"  expected raw structure: {template_structure_file}\n"
+                        f"  expected precache: {precache_entry_file}\n"
+                        f"  structure arrays: {template_structure_array_subdirectory}\n"
+                        f"  structure arrays available: {structure_arrays_available}\n"
+                        f"  fetch_missing_structures: {self.fetch_missing_structures}"
+                    )
+                    if self.create_logs:
+                        worker_logger.warning(message)
+                    else:
+                        print(message)
+
                 # C. Fetch template structure if needed
                 # We need
                 # - either the raw template structure
                 # - or the precache entry and the structure arrays both
-                if (not structure_available) & (not precache_entry_available):
+                # Dont fetch if the template is CIF-direct -
+                # user may have inputted something not on the PDB
+                if (
+                    not is_cif_direct
+                    and not structure_available
+                    and not precache_entry_available
+                ):
                     if not self.fetch_missing_structures:
                         worker_logger.info(
                             f"Template structure for {template.entry_id} is "
@@ -2543,8 +2607,21 @@ class TemplatePreprocessor:
                             continue
 
                 # D. Load template structure
+                if is_cif_direct:
+                    worker_logger.info(
+                        f"Loading direct CIF structure {template_structure_file}."
+                    )
+                    cif_file, _ = parse_mmcif(template_structure_file)
+                    chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
+                    try:
+                        release_date = get_release_date(
+                            get_cif_block(cif_file)
+                        ).strftime("%Y-%m-%d")
+                    except KeyError:
+                        release_date = None
+
                 # i. from precache if available
-                if precache_entry_available:
+                elif precache_entry_available:
                     worker_logger.info(f"Loading precache entry {precache_entry_file}.")
 
                     with np.load(
@@ -2629,11 +2706,11 @@ class TemplatePreprocessor:
                     template = realigned._replace(index=template.index)
 
                 # F. Apply release date checks
-                if not isinstance(release_date, datetime):
+                if release_date is not None and not isinstance(release_date, datetime):
                     release_date = datetime.strptime(release_date, "%Y-%m-%d")
                 # min_release_date_diff needs the query's release date: applied per
                 # structure in _update_dataset_cache, and not used in predict mode.
-                if fails_template_release_date_checks(
+                if release_date is not None and fails_template_release_date_checks(
                     template_release_date=release_date,
                     query_release_date=None,
                     max_template_release_date=self.max_release_date,
@@ -2734,12 +2811,10 @@ class TemplatePrecachePreprocessor:
         self.precache_directory = config.precache_directory
         self.min_f_resolved = config.min_f_resolved
 
-        self.template_entries = list(
-            iter_template_structure_entries(
-                self.structure_directory, self.structure_file_format
-            )
+        self.template_structure_paths = get_template_structure_paths(
+            self.structure_directory, self.structure_file_format
         )
-        self.template_entry_ids = [entry.entry_id for entry in self.template_entries]
+        self.template_entry_ids = list(self.template_structure_paths)
 
         if not self.template_entry_ids:
             print(
@@ -2793,7 +2868,7 @@ class TemplatePrecachePreprocessor:
                 print(f"Precache entry {template_entry_id} already exists, skipping.")
                 return
 
-            cif_file = _load_ciffile(template_entry.path)
+            cif_file = _load_ciffile(self.template_structure_paths[template_entry_id])
             chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
             release_date = get_release_date(get_cif_block(cif_file)).strftime(
                 "%Y-%m-%d"
@@ -2925,12 +3000,10 @@ class TemplateStructurePreprocessor:
         else:
             self.ccd = BiotiteCCDWrapper()
 
-        self.template_entries = list(
-            iter_template_structure_entries(
-                self.structure_directory, self.structure_file_format
-            )
+        self.template_structure_paths = get_template_structure_paths(
+            self.structure_directory, self.structure_file_format
         )
-        self.template_entry_ids = [entry.entry_id for entry in self.template_entries]
+        self.template_entry_ids = list(self.template_structure_paths)
 
         if not self.template_entry_ids:
             print(

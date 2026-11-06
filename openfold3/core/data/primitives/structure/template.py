@@ -38,6 +38,9 @@ from openfold3.core.data.primitives.structure.cleanup import (
     remove_waters,
 )
 from openfold3.core.data.primitives.structure.metadata import get_cif_block
+from openfold3.core.data.primitives.structure.template_paths import (
+    resolve_template_structure_path,
+)
 from openfold3.core.data.primitives.structure.unresolved import (
     add_unresolved_atoms,
 )
@@ -201,6 +204,28 @@ def sample_templates(
 
     template_ids = np.array(template_ids)
 
+    # Load cache metadata before filtering structure arrays. CIF-direct templates
+    # carry their own structure path and do not require a shared array.
+    template_cache_entry = None
+    if template_cache_directory is not None:
+        if "alignment_representative_id" in chain_data:
+            if use_roda_monomer_format:
+                template_file_name = (
+                    Path(chain_data["alignment_representative_id"]) / "template.npz"
+                )
+            else:
+                template_file_name = Path(
+                    chain_data["alignment_representative_id"] + ".npz"
+                )
+            template_cache_path = template_cache_directory / template_file_name
+        else:
+            template_cache_path = chain_data["cache_entry_file_path"]
+
+        with np.load(template_cache_path, allow_pickle=True) as template_cache_npz:
+            template_cache_entry = {
+                key: value.item() for key, value in template_cache_npz.items()
+            }
+
     # Subset the template IDs to only those that have a pre-parsed structure array
     # Some arrays may be missing due to preprocessing errors
     # TODO: add logging for this
@@ -213,13 +238,24 @@ def sample_templates(
                 / f"{template_pdb_id}/{template_id}.{template_file_format}"
             )
 
-            if not template_struct_path.exists():
+            has_direct_cif = (
+                template_cache_entry is not None
+                and "cif_path" in template_cache_entry[template_id]
+            )
+            if not template_struct_path.exists() and not has_direct_cif:
                 logger.warning(f"Template path does not exist: {template_struct_path}")
 
             template_array_paths.append(template_struct_path)
 
         template_ids = template_ids[
-            np.array([p.exists() for p in template_array_paths]).astype(bool)
+            np.array(
+                [
+                    p.exists() or "cif_path" in template_cache_entry[template_id]
+                    for p, template_id in zip(
+                        template_array_paths, template_ids, strict=True
+                    )
+                ]
+            ).astype(bool)
         ]
 
     l = len(template_ids)
@@ -233,30 +269,6 @@ def sample_templates(
         k = np.min([np.random.randint(0, l + 1), n_templates])
 
     if k > 0 and template_cache_directory is not None:
-        # Load template cache entry numpy file
-        # From the representative ID during training
-        if "alignment_representative_id" in chain_data:
-            if use_roda_monomer_format:
-                template_file_name = (
-                    Path(chain_data["alignment_representative_id"]) / "template.npz"
-                )
-            else:
-                template_file_name = Path(
-                    chain_data["alignment_representative_id"] + ".npz"
-                )
-
-            template_cache_path = template_cache_directory / template_file_name
-
-        # From the file path during inference
-        else:
-            template_cache_path = chain_data["cache_entry_file_path"]
-
-        with np.load(template_cache_path, allow_pickle=True) as template_cache_npz:
-            # Unpack into dict
-            template_cache_entry = {
-                key: value.item() for key, value in template_cache_npz.items()
-            }
-
         # Randomly sample k templates (core PDB training sets) or take top k templates
         # (distillation, inference sets)
         if take_top_k:
@@ -270,7 +282,11 @@ def sample_templates(
                 index=template_cache_entry[template_id]["index"],
                 release_date=template_cache_entry[template_id]["release_date"],
                 idx_map=template_cache_entry[template_id]["idx_map"],
-                # TODO: this will never read cif_path from the cache
+                cif_path=(
+                    Path(template_cache_entry[template_id]["cif_path"])
+                    if "cif_path" in template_cache_entry[template_id]
+                    else None
+                ),
             )
             for template_id in sampled_template_ids
         }
@@ -356,18 +372,34 @@ def parse_template_structure(
         AtomArray:
             The cleaned up template atom array for the given chain.
     """
-    # Parse template IDs
-    pdb_id, chain_id = template_pdb_chain_id.split("_")
+    # The entry ID comes from the CIF filename and may contain underscores.
+    entry_id, chain_id = template_pdb_chain_id.rsplit("_", 1)
 
     # Initialize cache if not provided
     if cif_assembly_cache is None:
         cif_assembly_cache = {}
 
+    # CIF-direct paths are authoritative, even when a shared array exists.
+    if cif_path is not None:
+        cache_key = str(cif_path)
+        if cache_key in cif_assembly_cache:
+            cif_file, atom_array_template_assembly = cif_assembly_cache[cache_key]
+        else:
+            result = parse_mmcif(cif_path)
+            if isinstance(result, SkippedStructure):
+                return None
+            cif_file, atom_array_template_assembly = result
+            cif_assembly_cache[cache_key] = (cif_file, atom_array_template_assembly)
+
+        atom_array_template_chain = clean_template_atom_array(
+            atom_array_template_assembly, cif_file, chain_id, ccd
+        )
+
     # Parse the pre-parsed template structure array
-    if template_structure_array_directory is not None:
+    elif template_structure_array_directory is not None:
         template_structure_array_file = (
             template_structure_array_directory
-            / f"{pdb_id}/{pdb_id}_{chain_id}.{template_file_format}"
+            / f"{entry_id}/{entry_id}_{chain_id}.{template_file_format}"
         )
 
         if template_file_format == "pkl":
@@ -383,39 +415,29 @@ def parse_template_structure(
                 "Only pickle or npz formats are supported."
             )
 
-    # CIF-direct mode: use the provided CIF path directly
-    elif cif_path is not None:
-        cache_key = str(cif_path)
+    # Parse and clean the raw template structure file from directory
+    elif template_structures_directory is not None:
+        template_structure_path = resolve_template_structure_path(
+            template_structures_directory,
+            entry_id,
+            f"{entry_id}.{template_file_format}",
+        )
+        cache_key = str(template_structure_path)
+        # Check cache first to avoid re-parsing the same CIF file for different chains
         if cache_key in cif_assembly_cache:
             cif_file, atom_array_template_assembly = cif_assembly_cache[cache_key]
-            logger.info(f"[CACHE HIT] Using cached CIF-direct assembly for {cif_path}")
+            logger.info(
+                f"[CACHE HIT] Using cached assembly for {template_structure_path}"
+            )
         else:
-            result = parse_mmcif(cif_path)
+            result = parse_mmcif(template_structure_path)
             if isinstance(result, SkippedStructure):
                 return None
             cif_file, atom_array_template_assembly = result
             cif_assembly_cache[cache_key] = (cif_file, atom_array_template_assembly)
-            logger.info(f"[CIF-DIRECT] Parsed {cif_path}")
-
-        atom_array_template_chain = clean_template_atom_array(
-            atom_array_template_assembly, cif_file, chain_id, ccd
-        )
-
-    # Parse and clean the raw template structure file from directory
-    elif template_structures_directory is not None:
-        # Check cache first to avoid re-parsing the same CIF file for different chains
-        if pdb_id in cif_assembly_cache:
-            cif_file, atom_array_template_assembly = cif_assembly_cache[pdb_id]
-            logger.info(f"[CACHE HIT] Using cached assembly for {pdb_id}")
-        else:
-            result = parse_mmcif(
-                template_structures_directory / Path(f"{pdb_id}.{template_file_format}")
+            logger.info(
+                f"[CACHE MISS] Parsed and cached assembly for {template_structure_path}"
             )
-            if isinstance(result, SkippedStructure):
-                return None
-            cif_file, atom_array_template_assembly = result
-            cif_assembly_cache[pdb_id] = (cif_file, atom_array_template_assembly)
-            logger.info(f"[CACHE MISS] Parsed and cached assembly for {pdb_id}")
 
         # Clean up the template atom array and subset to the chosen template chain
         atom_array_template_chain = clean_template_atom_array(

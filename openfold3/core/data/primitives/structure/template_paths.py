@@ -9,9 +9,14 @@ from tqdm import tqdm
 
 @dataclass(frozen=True)
 class TemplateEntry:
-    """A template entry ID paired with the structure file that contains it."""
+    """A template entry ID paired with the structure file that contains it.
 
-    entry_id: str
+    The path is retained rather than only its filename because template structures
+    may be discovered in a different directory. ``filename`` keeps the convenient
+    CIF-direct view for callers that only need the basename.
+    """
+
+    entry_id: str  # could be a pdb code, or a resolved filename
     path: Path
 
     @property
@@ -32,23 +37,43 @@ class TemplateEntry:
         raise ValueError(f"CIF input must end in '.cif' or '.cif.gz': {path}")
 
 
+def resolve_template_structure_path(
+    template_structures_directory: Path,
+    pdb_id: str,
+    template_filename: str,
+) -> Path:
+    """Resolve a template in the flat directory.
+    TODO: add support for sharded subdirectories.
+    """
+    flat_path = template_structures_directory / template_filename
+    if flat_path.is_file():
+        return flat_path
+
+    raise FileNotFoundError(
+        f"No template structure found for {pdb_id}: "
+        f"checked {flat_path} and its sharded path"
+    )
+
+
 def iter_template_structure_paths(
     template_structures_directory: Path,
     template_file_format: str,
 ) -> Iterator[Path]:
-    """Yield all matching template files in deterministic filename order."""
-    if not template_structures_directory.is_dir():
-        return
+    """Yield all template files for preprocessing from flat directories.
 
+    Unlike ``resolve_template_structure_path``, this function intentionally
+    iterates the directory contents because preprocessing needs every template.
+    """
     suffix = f".{template_file_format}"
-    paths_by_name = {
-        path.name: path
-        for path in tqdm(
-            template_structures_directory.iterdir(),
-            desc="Scanning template structures",
-        )
-        if path.is_file() and path.name.endswith(suffix)
-    }
+    paths_by_name: dict[str, Path] = {}
+
+    for path in tqdm(
+        template_structures_directory.iterdir(),
+        desc="Scanning template structures",
+    ):
+        if path.is_file() and path.name.endswith(suffix):
+            paths_by_name[path.name] = path
+
     yield from (paths_by_name[name] for name in sorted(paths_by_name))
 
 
@@ -56,9 +81,22 @@ def iter_template_structure_entries(
     template_structures_directory: Path,
     template_file_format: str,
 ) -> Iterator[TemplateEntry]:
-    """Yield discovered template files paired with normalized entry IDs."""
+    """Yield discovered template files with their normalized entry IDs."""
     suffix = f".{template_file_format}"
     for path in iter_template_structure_paths(
         template_structures_directory, template_file_format
     ):
         yield TemplateEntry.from_path(path, suffix)
+
+
+def get_template_structure_paths(
+    template_structures_directory: Path,
+    template_file_format: str,
+) -> dict[str, Path]:
+    """Return template structure paths indexed by entry ID."""
+    return {
+        entry.entry_id: entry.path
+        for entry in iter_template_structure_entries(
+            template_structures_directory, template_file_format
+        )
+    }
