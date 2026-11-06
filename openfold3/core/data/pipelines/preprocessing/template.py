@@ -2367,6 +2367,15 @@ class TemplatePreprocessor:
         worker_logger = self._worker_logger()
         if self.create_logs:
             worker_logger.setLevel(logging.INFO)
+            worker_logger.propagate = False
+
+            # A multiprocessing worker can process multiple queries. Remove any
+            # handler left by an earlier query so each query gets a live, flushed
+            # file handler rather than reusing a closed or inherited handler.
+            for handler in list(worker_logger.handlers):
+                worker_logger.removeHandler(handler)
+                handler.close()
+
             handler = logging.FileHandler(self.log_directory / f"{os.getpid()}.log")
             handler.setLevel(logging.INFO)
             formatter = logging.Formatter("%(message)s")
