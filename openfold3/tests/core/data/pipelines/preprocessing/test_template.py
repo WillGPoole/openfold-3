@@ -49,6 +49,7 @@ from openfold3.core.data.primitives.sequence.hash import get_sequence_hash
 from openfold3.core.data.primitives.structure.metadata import (
     get_asym_id_to_canonical_seq_dict,
 )
+from openfold3.core.data.primitives.structure.template_paths import TemplateEntry
 from openfold3.core.data.resources.residues import MoleculeType
 from openfold3.projects.of3_all_atom.config.inference_query_format import (
     Chain,
@@ -598,6 +599,43 @@ def test_standalone_template_consumers_create_output_when_called(
     assert output_directory.is_dir()
 
 
+@pytest.mark.parametrize(
+    "preprocessor_cls,preprocessor_flag",
+    [
+        pytest.param(TemplatePrecachePreprocessor, "create_precache", id="precache"),
+        pytest.param(
+            TemplateStructurePreprocessor, "preparse_structures", id="structure-arrays"
+        ),
+    ],
+)
+def test_standalone_template_consumers_keep_compressed_source_path(
+    tmp_path, preprocessor_cls, preprocessor_flag
+):
+    structure_directory = tmp_path / "structures"
+    structure_directory.mkdir()
+    structure_path = structure_directory / "model_rank_2.cif.gz"
+    structure_path.touch()
+    system_tmp = tmp_path / "tmp"
+
+    with patch(
+        "openfold3.core.data.tools.utils.tempfile.gettempdir",
+        return_value=str(system_tmp),
+    ):
+        settings = TemplatePreprocessorSettings(
+            structure_directory=structure_directory,
+            structure_file_format="cif.gz",
+            worker_pool="thread",
+            **{preprocessor_flag: True},
+        )
+
+    preprocessor = preprocessor_cls(settings)
+
+    assert preprocessor.template_entry_ids == ["model_rank_2"]
+    assert preprocessor.template_entries == [
+        TemplateEntry(entry_id="model_rank_2", path=structure_path)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tier C: bare-instance methods (no __init__, no mp.Pool)
 # ---------------------------------------------------------------------------
@@ -931,12 +969,12 @@ def test_template_sources_do_not_collide_across_queries(tmp_path, order):
     custom = iqs.queries["q_custom"].chains[0]
     colabfold = iqs.queries["q_colabfold"].chains[0]
 
-    assert custom.template_entry_chain_ids == ["2q2k_B"], (
-        "the custom CIF query did not get its own template"
-    )
-    assert colabfold.template_entry_chain_ids == ["2q2k_C"], (
-        "the ColabFold query did not get its own template"
-    )
+    assert custom.template_entry_chain_ids == [
+        "2q2k_B"
+    ], "the custom CIF query did not get its own template"
+    assert colabfold.template_entry_chain_ids == [
+        "2q2k_C"
+    ], "the ColabFold query did not get its own template"
     assert (
         custom.template_alignment_file_path != colabfold.template_alignment_file_path
     ), "both queries were pointed at the same template cache entry"
@@ -1010,16 +1048,16 @@ def test_requeued_query_set_keeps_cached_templates(tmp_path):
     preprocessor()
 
     requeued_cached = run_2_qs.queries["q_colabfold"].chains[0]
-    assert requeued_cached.template_alignment_file_path == cached_path, (
-        "the cached template entry was dropped when the query set was reused"
-    )
-    assert requeued_cached.template_entry_chain_ids == ["2q2k_C"], (
-        "the template ids were dropped when the query set was reused"
-    )
+    assert (
+        requeued_cached.template_alignment_file_path == cached_path
+    ), "the cached template entry was dropped when the query set was reused"
+    assert requeued_cached.template_entry_chain_ids == [
+        "2q2k_C"
+    ], "the template ids were dropped when the query set was reused"
     requeued_raw = run_2_qs.queries["q_custom"].chains[0]
-    assert requeued_raw.template_entry_chain_ids == ["2q2k_B"], (
-        "the raw source in the reused batch was not processed"
-    )
+    assert requeued_raw.template_entry_chain_ids == [
+        "2q2k_B"
+    ], "the raw source in the reused batch was not processed"
     # Only the raw source needs preprocessing; the cached entry must not be
     # re-parsed as an alignment.
     assert len(preprocessor.inputs) == 1

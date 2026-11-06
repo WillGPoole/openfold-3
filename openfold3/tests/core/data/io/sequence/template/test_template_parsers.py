@@ -259,7 +259,6 @@ def test_cif_direct_parser_reads_gzipped_template():
         cif_file_path=cif_path,
         query_seq_str=query_seq_str,
         chain_id_seq_map=chain_id_seq_map,
-        entry_id="1fdl",
         specified_chain_id=chain_id,
     )
 

@@ -100,6 +100,10 @@ from openfold3.core.data.primitives.structure.template import (
     TemplateCacheEntry,
     clean_template_atom_array,
 )
+from openfold3.core.data.primitives.structure.template_paths import (
+    TemplateEntry,
+    iter_template_structure_entries,
+)
 from openfold3.core.data.resources.residues import (
     MoleculeType,
 )
@@ -2730,13 +2734,12 @@ class TemplatePrecachePreprocessor:
         self.precache_directory = config.precache_directory
         self.min_f_resolved = config.min_f_resolved
 
-        # Get list of template entry IDs
-        self.template_entry_ids = [
-            f.stem
-            for f in list(
-                self.structure_directory.glob(f"*.{self.structure_file_format}")
+        self.template_entries = list(
+            iter_template_structure_entries(
+                self.structure_directory, self.structure_file_format
             )
-        ]
+        )
+        self.template_entry_ids = [entry.entry_id for entry in self.template_entries]
 
         if not self.template_entry_ids:
             print(
@@ -2765,7 +2768,7 @@ class TemplatePrecachePreprocessor:
             for _ in tqdm(
                 pool.imap_unordered(
                     self._preprocess_template_precache_entry,
-                    self.template_entry_ids,
+                    self.template_entries,
                     chunksize=self.chunksize,
                 ),
                 total=len(self.template_entry_ids),
@@ -2775,24 +2778,22 @@ class TemplatePrecachePreprocessor:
 
     def _preprocess_template_precache_entry(
         self,
-        template_entry_id: str,
+        template_entry: TemplateEntry,
     ) -> None:
         """Create a precache entry for a single template structure.
 
         Args:
-            template_entry_id (str):
-                Entry ID of the template structure, typically, PDB ID.
+            template_entry (TemplateEntry):
+                Entry ID and source path for the template structure.
         """
         try:
+            template_entry_id = template_entry.entry_id
             precache_entry_file = self.precache_directory / f"{template_entry_id}.npz"
             if precache_entry_file.exists():
                 print(f"Precache entry {template_entry_id} already exists, skipping.")
                 return
 
-            cif_file = _load_ciffile(
-                self.structure_directory
-                / f"{template_entry_id}.{self.structure_file_format}"
-            )
+            cif_file = _load_ciffile(template_entry.path)
             chain_id_seq_map = get_asym_id_to_canonical_seq_dict(cif_file)
             release_date = get_release_date(get_cif_block(cif_file)).strftime(
                 "%Y-%m-%d"
@@ -2924,12 +2925,12 @@ class TemplateStructurePreprocessor:
         else:
             self.ccd = BiotiteCCDWrapper()
 
-        self.template_entry_ids = [
-            f.stem
-            for f in list(
-                self.structure_directory.glob(f"*.{self.structure_file_format}")
+        self.template_entries = list(
+            iter_template_structure_entries(
+                self.structure_directory, self.structure_file_format
             )
-        ]
+        )
+        self.template_entry_ids = [entry.entry_id for entry in self.template_entries]
 
         if not self.template_entry_ids:
             print(
@@ -2950,7 +2951,7 @@ class TemplateStructurePreprocessor:
             for _ in tqdm(
                 pool.imap_unordered(
                     self._preprocess_template_structure_for_template,
-                    self.template_entry_ids,
+                    self.template_entries,
                     chunksize=self.chunksize,
                 ),
                 total=len(self.template_entry_ids),
@@ -2960,20 +2961,19 @@ class TemplateStructurePreprocessor:
 
     def _preprocess_template_structure_for_template(
         self,
-        template_entry_id: str,
+        template_entry: TemplateEntry,
     ) -> None:
         try:
             preprocess_template_structure_for_template(
-                self.structure_directory
-                / f"{template_entry_id}.{self.structure_file_format}",
-                self.structure_array_directory / f"{template_entry_id}",
+                template_entry.path,
+                self.structure_array_directory / template_entry.entry_id,
                 self.ccd,
                 self.moltypes,
             )
         except Exception as e:
             print(
                 f"Failed to preprocess template structure "
-                f"{template_entry_id}:"
+                f"{template_entry.entry_id}:"
                 f"\n\nException:\n{str(e)}"
                 f"\n\nType:\n{type(e).__name__}"
                 f"\n\nTraceback:\n{traceback.format_exc()}"
